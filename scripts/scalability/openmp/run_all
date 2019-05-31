@@ -1,12 +1,15 @@
 #!/bin/bash
 
+# move to root project dir
+cd ../../../
+
 # Source environment variables for parsec scripts
-source ../../../env.sh
+source env.sh
 
 # Run scripts in sbatch
-sbatch ./scalability_openmp_1
-sbatch ./scalability_openmp_2
-sbatch ./scalability_openmp_4
-sbatch ./scalability_openmp_8
-sbatch ./scalability_openmp_16
-sbatch ./scalability_openmp_32
+sbatch ./scripts/scalability/openmp/scalability_openmp_1
+sbatch ./scripts/scalability/openmp/scalability_openmp_2
+sbatch ./scripts/scalability/openmp/scalability_openmp_4
+sbatch ./scripts/scalability/openmp/scalability_openmp_8
+sbatch ./scripts/scalability/openmp/scalability_openmp_16
+sbatch ./scripts/scalability/openmp/scalability_openmp_32
