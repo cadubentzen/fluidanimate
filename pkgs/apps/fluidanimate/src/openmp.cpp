@@ -1,6 +1,6 @@
 //Code written by Richard O. Lee and Christian Bienia
 //Modified by Christian Fensch
-
+//Modified by Carlos Eduardo Ramalho, Isolda Muniz and Ana Luisa
 
 
 #include <cstdlib>
@@ -17,6 +17,8 @@
 #include <math.h>
 #include <assert.h>
 #include <float.h>
+
+#include <omp.h>
 
 #include "fluid.hpp"
 #include "cellpool.hpp"
@@ -63,15 +65,7 @@ struct Grid
   };
 } *grids;
 bool  *border;
-pthread_attr_t attr;
-pthread_t *thread;
-pthread_mutex_t **mutex;  // used to lock cells in RebuildGrid and also particles in other functions
-pthread_barrier_t barrier;  // global barrier used by all threads
-
-typedef struct __thread_args {
-  int tid;      //thread id, determines work partition
-  int frames;      //number of frames to compute
-} thread_args;      //arguments for threads
+omp_lock_t **lock;  // used to lock cells in RebuildGrid and also particles in other functions
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -120,7 +114,6 @@ void InitSim(char const *fileName, unsigned int threadnum)
   if(XDIVS*ZDIVS != threadnum) XDIVS*=2;
   assert(XDIVS * ZDIVS == threadnum);
 
-  thread = new pthread_t[NUM_GRIDS];
   grids = new struct Grid[NUM_GRIDS];
   assert(sizeof(Grid) <= CACHELINE_SIZE); // as we put and aligh grid on the cacheline size to avoid false-sharing
                                           // if asserts fails - increase pp union member in Grid declarationi
@@ -245,19 +238,15 @@ void InitSim(char const *fileName, unsigned int threadnum)
            } // for(int dk = -1; dk <= 1; ++dk)
         }
 
-  pthread_attr_init(&attr);
-  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-
-  mutex = new pthread_mutex_t *[numCells];
+  lock = new omp_lock_t *[numCells];
   for(int i = 0; i < numCells; ++i)
   {
     assert(CELL_MUTEX_ID < MUTEXES_PER_CELL);
     int n = (border[i] ? MUTEXES_PER_CELL : CELL_MUTEX_ID+1);
-    mutex[i] = new pthread_mutex_t[n];
+    lock[i] = new omp_lock_t[n];
     for(int j = 0; j < n; ++j)
-      pthread_mutex_init(&mutex[i][j], NULL);
+      omp_init_lock(&lock[i][j]);
   }
-  pthread_barrier_init(&barrier, NULL, NUM_GRIDS);
   //make sure Cell structure is multiple of estiamted cache line size
   assert(sizeof(Cell) % CACHELINE_SIZE == 0);
   //make sure helper Cell structure is in sync with real Cell structure
@@ -459,18 +448,16 @@ void CleanUpSim()
   //      itself. This guarantees that all allocated cells will be freed but it might
   //      render other cell pools unusable so they also have to be destroyed.
   for(int i=0; i<NUM_GRIDS; i++) cellpool_destroy(&pools[i]);
-  pthread_attr_destroy(&attr);
 
   for(int i = 0; i < numCells; ++i)
   {
     assert(CELL_MUTEX_ID < MUTEXES_PER_CELL);
     int n = (border[i] ? MUTEXES_PER_CELL : CELL_MUTEX_ID+1);
     for(int j = 0; j < n; ++j)
-      pthread_mutex_destroy(&mutex[i][j]);
-    delete[] mutex[i];
+      omp_destroy_lock(&lock[i][j]);
+    delete[] lock[i];
   }
-  delete[] mutex;
-  pthread_barrier_destroy(&barrier);
+  delete[] lock;
 
   delete[] border;
 
@@ -487,7 +474,6 @@ void CleanUpSim()
   free(cnumPars2);
   free(last_cells);
 #endif
-  delete[] thread;
   delete[] grids;
 }
 
@@ -536,14 +522,6 @@ void RebuildGridMT(int tid)
           if(ci < 0) ci = 0; else if(ci > (nx-1)) ci = nx-1;
           if(cj < 0) cj = 0; else if(cj > (ny-1)) cj = ny-1;
           if(ck < 0) ck = 0; else if(ck > (nz-1)) ck = nz-1;
-#if 0
-		  assert(ci>=ix-1);
-		  assert(ci<=ix+1);
-		  assert(cj>=iy-1);
-		  assert(cj<=iy+1);
-		  assert(ck>=iz-1);
-		  assert(ck<=iz+1);
-#endif
 #ifdef ENABLE_CFL_CHECK
           //check that source cell is a neighbor of destination cell
           bool cfl_cond_satisfied=false;
@@ -574,7 +552,7 @@ void RebuildGridMT(int tid)
           int index = (ck*ny + cj)*nx + ci;
           // this assumes that particles cannot travel more than one grid cell per time step
           if(border[index])
-            pthread_mutex_lock(&mutex[index][CELL_MUTEX_ID]);
+            omp_set_lock(&lock[index][CELL_MUTEX_ID]);
           Cell *cell = last_cells[index];
           int np = cnumPars[index];
 
@@ -586,7 +564,7 @@ void RebuildGridMT(int tid)
           }
           ++cnumPars[index];
           if(border[index])
-            pthread_mutex_unlock(&mutex[index][CELL_MUTEX_ID]);
+            omp_unset_lock(&lock[index][CELL_MUTEX_ID]);
 
           //copy source to destination particle
           
@@ -703,18 +681,18 @@ void ComputeDensitiesMT(int tid)
 
                   if(border[index])
                   {
-                    pthread_mutex_lock(&mutex[index][ipar % MUTEXES_PER_CELL]);
+                    omp_set_lock(&lock[index][ipar % MUTEXES_PER_CELL]);
                     cell->density[ipar % PARTICLES_PER_CELL] += tc;
-                    pthread_mutex_unlock(&mutex[index][ipar % MUTEXES_PER_CELL]);
+                    omp_unset_lock(&lock[index][ipar % MUTEXES_PER_CELL]);
                   }
                   else
                     cell->density[ipar % PARTICLES_PER_CELL] += tc;
 
                   if(border[indexNeigh])
                   {
-                    pthread_mutex_lock(&mutex[indexNeigh][iparNeigh % MUTEXES_PER_CELL]);
+                    omp_set_lock(&lock[indexNeigh][iparNeigh % MUTEXES_PER_CELL]);
                     neigh->density[iparNeigh % PARTICLES_PER_CELL] += tc;
-                    pthread_mutex_unlock(&mutex[indexNeigh][iparNeigh % MUTEXES_PER_CELL]);
+                    omp_unset_lock(&lock[indexNeigh][iparNeigh % MUTEXES_PER_CELL]);
                   }
                   else
                     neigh->density[iparNeigh % PARTICLES_PER_CELL] += tc;
@@ -805,18 +783,18 @@ void ComputeForcesMT(int tid)
 
                   if( border[index])
                   {
-                    pthread_mutex_lock(&mutex[index][ipar % MUTEXES_PER_CELL]);
+                    omp_set_lock(&lock[index][ipar % MUTEXES_PER_CELL]);
                     cell->a[ipar % PARTICLES_PER_CELL] += acc;
-                    pthread_mutex_unlock(&mutex[index][ipar % MUTEXES_PER_CELL]);
+                    omp_unset_lock(&lock[index][ipar % MUTEXES_PER_CELL]);
                   }
                   else
                     cell->a[ipar % PARTICLES_PER_CELL] += acc;
 
                   if( border[indexNeigh])
                   {
-                    pthread_mutex_lock(&mutex[indexNeigh][iparNeigh % MUTEXES_PER_CELL]);
+                    omp_set_lock(&lock[indexNeigh][iparNeigh % MUTEXES_PER_CELL]);
                     neigh->a[iparNeigh % PARTICLES_PER_CELL] -= acc;
-                    pthread_mutex_unlock(&mutex[indexNeigh][iparNeigh % MUTEXES_PER_CELL]);
+                    omp_unset_lock(&lock[indexNeigh][iparNeigh % MUTEXES_PER_CELL]);
                   }
                   else
                     neigh->a[iparNeigh % PARTICLES_PER_CELL] -= acc;
@@ -836,60 +814,6 @@ void ComputeForcesMT(int tid)
       }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-
-// ProcessCollisions() with container walls
-// Under the assumptions that
-// a) a particle will not penetrate a wall
-// b) a particle will not migrate further than once cell
-// c) the parSize is smaller than a cell
-// then only the particles at the perimiters may be influenced by the walls
-#if 0
-void ProcessCollisionsMT(int tid)
-{
-  for(int iz = grids[tid].sz; iz < grids[tid].ez; ++iz)
-    for(int iy = grids[tid].sy; iy < grids[tid].ey; ++iy)
-      for(int ix = grids[tid].sx; ix < grids[tid].ex; ++ix)
-      {
-        int index = (iz*ny + iy)*nx + ix;
-        Cell *cell = &cells[index];
-        int np = cnumPars[index];
-        for(int j = 0; j < np; ++j)
-        {
-          Vec3 pos = cell->p[j % PARTICLES_PER_CELL] + cell->hv[j % PARTICLES_PER_CELL] * timeStep;
-
-          fptype diff = parSize - (pos.x - domainMin.x);
-          if(diff > epsilon)
-            cell->a[j % PARTICLES_PER_CELL].x += stiffnessCollisions*diff - damping*cell->v[j % PARTICLES_PER_CELL].x;
-
-          diff = parSize - (domainMax.x - pos.x);
-          if(diff > epsilon)
-            cell->a[j % PARTICLES_PER_CELL].x -= stiffnessCollisions*diff + damping*cell->v[j % PARTICLES_PER_CELL].x;
-
-          diff = parSize - (pos.y - domainMin.y);
-          if(diff > epsilon)
-            cell->a[j % PARTICLES_PER_CELL].y += stiffnessCollisions*diff - damping*cell->v[j % PARTICLES_PER_CELL].y;
-
-          diff = parSize - (domainMax.y - pos.y);
-          if(diff > epsilon)
-            cell->a[j % PARTICLES_PER_CELL].y -= stiffnessCollisions*diff + damping*cell->v[j % PARTICLES_PER_CELL].y;
-
-          diff = parSize - (pos.z - domainMin.z);
-          if(diff > epsilon)
-            cell->a[j % PARTICLES_PER_CELL].z += stiffnessCollisions*diff - damping*cell->v[j % PARTICLES_PER_CELL].z;
-
-          diff = parSize - (domainMax.z - pos.z);
-          if(diff > epsilon)
-            cell->a[j % PARTICLES_PER_CELL].z -= stiffnessCollisions*diff + damping*cell->v[j % PARTICLES_PER_CELL].z;
-
-          //move pointer to next cell in list if end of array is reached
-          if(j % PARTICLES_PER_CELL == PARTICLES_PER_CELL-1) {
-            cell = cell->next;
-          }
-        }
-      }
-}
-#else
 void ProcessCollisionsMT(int tid)
 {
   for(int iz = grids[tid].sz; iz < grids[tid].ez; ++iz)
@@ -953,7 +877,6 @@ void ProcessCollisionsMT(int tid)
 	}
   }
 }
-#endif
 
 #define USE_ImpeneratableWall
 #if defined(USE_ImpeneratableWall)
@@ -965,14 +888,6 @@ void ProcessCollisions2MT(int tid)
 	{
       for(int ix = grids[tid].sx; ix < grids[tid].ex; ++ix)
       {
-#if 0
-// Chris, the following test should be valid
-// *** provided that a particle does not migrate more than 1 cell
-// *** per integration step. This does not appear to be the case
-// *** in the pthreads version. Serial version it seems to be OK
-	    if(!((ix==0)||(iy==0)||(iz==0)||(ix==(nx-1))||(iy==(ny-1))==(iz==(nz-1))))
-			continue;	// not on domain wall
-#endif
         int index = (iz*ny + iy)*nx + ix;
         Cell *cell = &cells[index];
         int np = cnumPars[index];
@@ -1093,46 +1008,45 @@ void AdvanceParticlesMT(int tid)
 void AdvanceFrameMT(int tid)
 {
   //swap src and dest arrays with particles
-  if(tid==0) {
+  #pragma omp master
+  {
     std::swap(cells, cells2);
     std::swap(cnumPars, cnumPars2);
   }
-  pthread_barrier_wait(&barrier);
+  #pragma omp barrier
 
   ClearParticlesMT(tid);
-  pthread_barrier_wait(&barrier);
+  #pragma omp barrier
   RebuildGridMT(tid);
-  pthread_barrier_wait(&barrier);
+  #pragma omp barrier
   InitDensitiesAndForcesMT(tid);
-  pthread_barrier_wait(&barrier);
+  #pragma omp barrier
   ComputeDensitiesMT(tid);
-  pthread_barrier_wait(&barrier);
+  #pragma omp barrier
   ComputeDensities2MT(tid);
-  pthread_barrier_wait(&barrier);
+  #pragma omp barrier
   ComputeForcesMT(tid);
-  pthread_barrier_wait(&barrier);
+  #pragma omp barrier
   ProcessCollisionsMT(tid);
-  pthread_barrier_wait(&barrier);
+  #pragma omp barrier
   AdvanceParticlesMT(tid);
-  pthread_barrier_wait(&barrier);
+  #pragma omp barrier
 #if defined(USE_ImpeneratableWall)
   // N.B. The integration of the position can place the particle
   // outside the domain. We now make a pass on the perimiter cells
   // to account for particle migration beyond domain.
   ProcessCollisions2MT(tid);
-  pthread_barrier_wait(&barrier);
+  #pragma omp barrier
 #endif
 }
 
-void *AdvanceFramesMT(void *args)
+void AdvanceFramesMT(int threadnum, int framenum)
 {
-  thread_args *targs = (thread_args *)args;
-
-  for(int i = 0; i < targs->frames; ++i) {
-    AdvanceFrameMT(targs->tid);
+  #pragma omp parallel num_threads(threadnum)
+  for(int i = 0; i < framenum; ++i) {
+    int tid = omp_get_thread_num();
+    AdvanceFrameMT(tid);
   }
-  
-  return NULL;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1178,20 +1092,9 @@ int main(int argc, char *argv[])
 #ifdef ENABLE_PARSEC_HOOKS
   __parsec_roi_begin();
 #endif
-#if defined(WIN32)
-  thread_args* targs = (thread_args*)alloca(sizeof(thread_args)*threadnum);
-#else
-  thread_args targs[threadnum];
-#endif
-  for(int i = 0; i < threadnum; ++i) {
-    targs[i].tid = i;
-    targs[i].frames = framenum;
-    pthread_create(&thread[i], &attr, AdvanceFramesMT, &targs[i]);
-  }
 
-  for(int i = 0; i < threadnum; ++i) {
-    pthread_join(thread[i], NULL);
-  }
+  AdvanceFramesMT(threadnum, framenum);
+
 #ifdef ENABLE_PARSEC_HOOKS
   __parsec_roi_end();
 #endif
