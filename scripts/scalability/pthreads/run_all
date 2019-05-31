@@ -1,0 +1,12 @@
+#!/bin/bash
+
+# Source environment variables for parsec scripts
+source ../../../env.sh
+
+# Run scripts in sbatch
+sbatch ./scalability_pthreads_1
+sbatch ./scalability_pthreads_2
+sbatch ./scalability_pthreads_4
+sbatch ./scalability_pthreads_8
+sbatch ./scalability_pthreads_16
+sbatch ./scalability_pthreads_32
