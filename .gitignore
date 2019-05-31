@@ -7,3 +7,6 @@ pkgs/apps/fluidanimate/run/
 *.swp
 
 slurm-*
+
+# VScode
+.vscode/
