@@ -1,12 +1,15 @@
 #!/bin/bash
 
+# move to root project dir
+cd ../../../
+
 # Source environment variables for parsec scripts
-source ../../../env.sh
+source env.sh
 
 # Run scripts in sbatch
-sbatch ./scalability_pthreads_1
-sbatch ./scalability_pthreads_2
-sbatch ./scalability_pthreads_4
-sbatch ./scalability_pthreads_8
-sbatch ./scalability_pthreads_16
-sbatch ./scalability_pthreads_32
+sbatch ./scripts/scalability/pthreads/scalability_pthreads_1
+sbatch ./scripts/scalability/pthreads/scalability_pthreads_2
+sbatch ./scripts/scalability/pthreads/scalability_pthreads_4
+sbatch ./scripts/scalability/pthreads/scalability_pthreads_8
+sbatch ./scripts/scalability/pthreads/scalability_pthreads_16
+sbatch ./scripts/scalability/pthreads/scalability_pthreads_32

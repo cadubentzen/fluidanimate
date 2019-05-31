@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=fluidanimate_scalability_pthreads
-#SBATCH --time=0-0:40
+#SBATCH --time=0-0:10
 #SBATCH --cpus-per-task=4
 #SBATCH --hint=compute_bound
 #SBATCH --mail-user=cadubentzen@gmail.com
