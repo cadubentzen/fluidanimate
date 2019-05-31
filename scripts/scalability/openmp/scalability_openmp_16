@@ -1,0 +1,13 @@
+#!/bin/bash
+#SBATCH --job-name=fluidanimate_scalability_openmp
+#SBATCH --time=0-0:3
+#SBATCH --cpus-per-task=16
+#SBATCH --hint=compute_bound
+#SBATCH --mail-user=cadubentzen@gmail.com
+#SBATCH --mail-type=ALL
+
+for i in 1 2 3
+do
+	parsecmgmt -a run -p parsec.fluidanimate -c gcc-openmp -i simlarge -n 16
+	parsecmgmt -a run -p parsec.fluidanimate -c gcc-openmp -i native -n 16
+done
