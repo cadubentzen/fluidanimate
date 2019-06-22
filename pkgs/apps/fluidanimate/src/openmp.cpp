@@ -212,6 +212,7 @@ void InitSim(char const *fileName, unsigned int threadnum)
   assert(gi == NUM_GRIDS);
 
   border = new bool[numCells];
+  unsigned numBorder = 0;
   for (int i = 0; i < NUM_GRIDS; ++i)
     for (int iz = grids[i].sz; iz < grids[i].ez; ++iz)
       for (int iy = grids[i].sy; iy < grids[i].ey; ++iy)
@@ -246,7 +247,7 @@ void InitSim(char const *fileName, unsigned int threadnum)
                     cj < grids[i].sy || cj >= grids[i].ey ||
                     ck < grids[i].sz || ck >= grids[i].ez)
                 {
-
+                  ++numBorder;
                   border[index] = true;
                   break;
                 }
@@ -258,6 +259,12 @@ void InitSim(char const *fileName, unsigned int threadnum)
               break;
           } // for(int dk = -1; dk <= 1; ++dk)
         }
+
+
+    std::cout << "Number of border cells: " << numBorder << "/" << numCells
+              << " (" << ((100.0 * numBorder) / numCells) <<  "%)" << std::endl;
+
+    
 
   lock = new omp_lock_t *[numCells];
   for (int i = 0; i < numCells; ++i)

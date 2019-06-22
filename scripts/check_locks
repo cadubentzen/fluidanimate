@@ -1,0 +1,14 @@
+#!/bin/bash
+
+# To use this script, comment the "AdvanceFramesMT" line in openmp.cpp
+
+for input in "test" simdev simsmall simmedium simlarge native
+do
+    echo "*** $input ***"
+    for i in 1 2 4 8 16 32 64
+    do
+        printf "$i: "
+        parsecmgmt -a run -p parsec.fluidanimate -c gcc-openmp -n $i -i $input | grep "Number of border cells"
+    done
+    echo ""
+done
