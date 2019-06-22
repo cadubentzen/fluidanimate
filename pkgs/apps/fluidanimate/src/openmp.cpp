@@ -53,6 +53,9 @@ int ZDIVS = 1; // number of partitions in Z
 #define MUTEXES_PER_CELL 128
 #define CELL_MUTEX_ID 0
 
+int threadnum = 1;
+int framenum = 1;
+
 struct Grid
 {
   union {
@@ -526,22 +529,20 @@ void CleanUpSim()
 
 ////////////////////////////////////////////////////////////////////////////////
 
-void ClearParticlesMT(int tid)
+void ClearParticlesMT()
 {
-  for (int iz = grids[tid].sz; iz < grids[tid].ez; ++iz)
-    for (int iy = grids[tid].sy; iy < grids[tid].ey; ++iy)
-      for (int ix = grids[tid].sx; ix < grids[tid].ex; ++ix)
-      {
-        int index = (iz * ny + iy) * nx + ix;
-        cnumPars[index] = 0;
-        cells[index].next = NULL;
-        last_cells[index] = &cells[index];
-      }
+  #pragma omp parallel for num_threads(threadnum)
+  for (int i = 0; i < numCells; ++i)
+  {
+    cnumPars[i] = 0;
+    cells[i].next = NULL;
+    last_cells[i] = &cells[i];
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
-void RebuildGridMT(int tid)
+void RebuildGridMT()
 {
   // Note, in parallel versions the below swaps
   // occure outside RebuildGrid()
@@ -551,76 +552,75 @@ void RebuildGridMT(int tid)
   //  std::swap(cnumPars, cnumPars2);
 
   //iterate through source cell lists
-  for (int iz = grids[tid].sz; iz < grids[tid].ez; ++iz)
-    for (int iy = grids[tid].sy; iy < grids[tid].ey; ++iy)
-      for (int ix = grids[tid].sx; ix < grids[tid].ex; ++ix)
+  #pragma omp parallel for num_threads(threadnum)
+  for (int i = 0; i < numCells; ++i)
+  {
+    int tid = omp_get_thread_num();
+    Cell *cell2 = &cells2[i];
+    int np2 = cnumPars2[i];
+    //iterate through source particles
+    for (int j = 0; j < np2; ++j)
+    {
+      //get destination for source particle
+      int ci = (int)((cell2->p[j % PARTICLES_PER_CELL].x - domainMin.x) / delta.x);
+      int cj = (int)((cell2->p[j % PARTICLES_PER_CELL].y - domainMin.y) / delta.y);
+      int ck = (int)((cell2->p[j % PARTICLES_PER_CELL].z - domainMin.z) / delta.z);
+
+      if (ci < 0)
+        ci = 0;
+      else if (ci > (nx - 1))
+        ci = nx - 1;
+      if (cj < 0)
+        cj = 0;
+      else if (cj > (ny - 1))
+        cj = ny - 1;
+      if (ck < 0)
+        ck = 0;
+      else if (ck > (nz - 1))
+        ck = nz - 1;
+
+      int index = (ck * ny + cj) * nx + ci;
+      // this assumes that particles cannot travel more than one grid cell per time step
+      if (border[index])
+        omp_set_lock(&lock[index][CELL_MUTEX_ID]);
+
+      Cell *cell = last_cells[index];
+      int np = cnumPars[index];
+
+      //add another cell structure if everything full
+      if ((np % PARTICLES_PER_CELL == 0) && (cnumPars[index] != 0))
       {
-        int index2 = (iz * ny + iy) * nx + ix;
-        Cell *cell2 = &cells2[index2];
-        int np2 = cnumPars2[index2];
-        //iterate through source particles
-        for (int j = 0; j < np2; ++j)
-        {
-          //get destination for source particle
-          int ci = (int)((cell2->p[j % PARTICLES_PER_CELL].x - domainMin.x) / delta.x);
-          int cj = (int)((cell2->p[j % PARTICLES_PER_CELL].y - domainMin.y) / delta.y);
-          int ck = (int)((cell2->p[j % PARTICLES_PER_CELL].z - domainMin.z) / delta.z);
+        cell->next = cellpool_getcell(&pools[tid]);
+        cell = cell->next;
+        last_cells[index] = cell;
+      }
+      ++cnumPars[index];
+      if (border[index])
+        omp_unset_lock(&lock[index][CELL_MUTEX_ID]);
 
-          if (ci < 0)
-            ci = 0;
-          else if (ci > (nx - 1))
-            ci = nx - 1;
-          if (cj < 0)
-            cj = 0;
-          else if (cj > (ny - 1))
-            cj = ny - 1;
-          if (ck < 0)
-            ck = 0;
-          else if (ck > (nz - 1))
-            ck = nz - 1;
-
-          int index = (ck * ny + cj) * nx + ci;
-          // this assumes that particles cannot travel more than one grid cell per time step
-          if (border[index])
-            omp_set_lock(&lock[index][CELL_MUTEX_ID]);
-
-          Cell *cell = last_cells[index];
-          int np = cnumPars[index];
-
-          //add another cell structure if everything full
-          if ((np % PARTICLES_PER_CELL == 0) && (cnumPars[index] != 0))
-          {
-            cell->next = cellpool_getcell(&pools[tid]);
-            cell = cell->next;
-            last_cells[index] = cell;
-          }
-          ++cnumPars[index];
-          if (border[index])
-            omp_unset_lock(&lock[index][CELL_MUTEX_ID]);
-
-          //copy source to destination particle
-          cell->p[np % PARTICLES_PER_CELL] = cell2->p[j % PARTICLES_PER_CELL];
-          cell->hv[np % PARTICLES_PER_CELL] = cell2->hv[j % PARTICLES_PER_CELL];
-          cell->v[np % PARTICLES_PER_CELL] = cell2->v[j % PARTICLES_PER_CELL];
-          //move pointer to next source cell in list if end of array is reached
-          if (j % PARTICLES_PER_CELL == PARTICLES_PER_CELL - 1)
-          {
-            Cell *temp = cell2;
-            cell2 = cell2->next;
-            //return cells to pool that are not statically allocated head of lists
-            if (temp != &cells2[index2])
-            {
-              //NOTE: This is thread-safe because temp and pool are thread-private, no need to synchronize
-              cellpool_returncell(&pools[tid], temp);
-            }
-          }
-        } // for(int j = 0; j < np2; ++j)
+      //copy source to destination particle
+      cell->p[np % PARTICLES_PER_CELL] = cell2->p[j % PARTICLES_PER_CELL];
+      cell->hv[np % PARTICLES_PER_CELL] = cell2->hv[j % PARTICLES_PER_CELL];
+      cell->v[np % PARTICLES_PER_CELL] = cell2->v[j % PARTICLES_PER_CELL];
+      //move pointer to next source cell in list if end of array is reached
+      if (j % PARTICLES_PER_CELL == PARTICLES_PER_CELL - 1)
+      {
+        Cell *temp = cell2;
+        cell2 = cell2->next;
         //return cells to pool that are not statically allocated head of lists
-        if ((cell2 != NULL) && (cell2 != &cells2[index2]))
+        if (temp != &cells2[i])
         {
-          cellpool_returncell(&pools[tid], cell2);
+          //NOTE: This is thread-safe because temp and pool are thread-private, no need to synchronize
+          cellpool_returncell(&pools[tid], temp);
         }
-      } // for(int ix = grids[tid].sx; ix < grids[tid].ex; ++ix)
+      }
+    } // for(int j = 0; j < np2; ++j)
+    //return cells to pool that are not statically allocated head of lists
+    if ((cell2 != NULL) && (cell2 != &cells2[i]))
+    {
+      cellpool_returncell(&pools[tid], cell2);
+    }
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -656,349 +656,361 @@ int InitNeighCellList(int ci, int cj, int ck, int *neighCells)
 
 ////////////////////////////////////////////////////////////////////////////////
 
-void InitDensitiesAndForcesMT(int tid)
+void InitDensitiesAndForcesMT()
 {
-  for (int iz = grids[tid].sz; iz < grids[tid].ez; ++iz)
-    for (int iy = grids[tid].sy; iy < grids[tid].ey; ++iy)
-      for (int ix = grids[tid].sx; ix < grids[tid].ex; ++ix)
+  #pragma omp parallel for num_threads(threadnum)
+  for (int i = 0; i < numCells; ++i)
+  {
+    Cell *cell = &cells[i];
+    int np = cnumPars[i];
+    for (int j = 0; j < np; ++j)
+    {
+      cell->density[j % PARTICLES_PER_CELL] = 0.0;
+      cell->a[j % PARTICLES_PER_CELL] = externalAcceleration;
+      //move pointer to next cell in list if end of array is reached
+      if (j % PARTICLES_PER_CELL == PARTICLES_PER_CELL - 1)
       {
-        int index = (iz * ny + iy) * nx + ix;
-        Cell *cell = &cells[index];
-        int np = cnumPars[index];
-        for (int j = 0; j < np; ++j)
-        {
-          cell->density[j % PARTICLES_PER_CELL] = 0.0;
-          cell->a[j % PARTICLES_PER_CELL] = externalAcceleration;
-          //move pointer to next cell in list if end of array is reached
-          if (j % PARTICLES_PER_CELL == PARTICLES_PER_CELL - 1)
-          {
-            cell = cell->next;
-          }
-        }
+        cell = cell->next;
       }
+    }
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
-void ComputeDensitiesMT(int tid)
+void ComputeDensitiesMT()
 {
-  int neighCells[3 * 3 * 3];
+  #pragma omp parallel num_threads(threadnum)
+  {
+    int tid = omp_get_thread_num();
+    int neighCells[3 * 3 * 3];
 
-  for (int iz = grids[tid].sz; iz < grids[tid].ez; ++iz)
-    for (int iy = grids[tid].sy; iy < grids[tid].ey; ++iy)
-      for (int ix = grids[tid].sx; ix < grids[tid].ex; ++ix)
-      {
-        int index = (iz * ny + iy) * nx + ix;
-        int np = cnumPars[index];
-        if (np == 0)
-          continue;
-
-        int numNeighCells = InitNeighCellList(ix, iy, iz, neighCells);
-
-        Cell *cell = &cells[index];
-        for (int ipar = 0; ipar < np; ++ipar)
+    for (int iz = grids[tid].sz; iz < grids[tid].ez; ++iz)
+      for (int iy = grids[tid].sy; iy < grids[tid].ey; ++iy)
+        for (int ix = grids[tid].sx; ix < grids[tid].ex; ++ix)
         {
-          for (int inc = 0; inc < numNeighCells; ++inc)
+          int index = (iz * ny + iy) * nx + ix;
+          int np = cnumPars[index];
+          if (np == 0)
+            continue;
+
+          int numNeighCells = InitNeighCellList(ix, iy, iz, neighCells);
+
+          Cell *cell = &cells[index];
+          for (int ipar = 0; ipar < np; ++ipar)
           {
-            int indexNeigh = neighCells[inc];
-            Cell *neigh = &cells[indexNeigh];
-            int numNeighPars = cnumPars[indexNeigh];
-            for (int iparNeigh = 0; iparNeigh < numNeighPars; ++iparNeigh)
+            for (int inc = 0; inc < numNeighCells; ++inc)
             {
-              //Check address to make sure densities are computed only once per pair
-              if (&neigh->p[iparNeigh % PARTICLES_PER_CELL] < &cell->p[ipar % PARTICLES_PER_CELL])
+              int indexNeigh = neighCells[inc];
+              Cell *neigh = &cells[indexNeigh];
+              int numNeighPars = cnumPars[indexNeigh];
+              for (int iparNeigh = 0; iparNeigh < numNeighPars; ++iparNeigh)
               {
-                fptype distSq = (cell->p[ipar % PARTICLES_PER_CELL] - neigh->p[iparNeigh % PARTICLES_PER_CELL]).GetLengthSq();
-                if (distSq < hSq)
+                //Check address to make sure densities are computed only once per pair
+                if (&neigh->p[iparNeigh % PARTICLES_PER_CELL] < &cell->p[ipar % PARTICLES_PER_CELL])
                 {
-                  fptype t = hSq - distSq;
-                  fptype tc = t * t * t;
-
-                  if (border[index])
+                  fptype distSq = (cell->p[ipar % PARTICLES_PER_CELL] - neigh->p[iparNeigh % PARTICLES_PER_CELL]).GetLengthSq();
+                  if (distSq < hSq)
                   {
-                    omp_set_lock(&lock[index][ipar % MUTEXES_PER_CELL]);
-                    cell->density[ipar % PARTICLES_PER_CELL] += tc;
-                    omp_unset_lock(&lock[index][ipar % MUTEXES_PER_CELL]);
-                  }
-                  else
-                    cell->density[ipar % PARTICLES_PER_CELL] += tc;
+                    fptype t = hSq - distSq;
+                    fptype tc = t * t * t;
 
-                  if (border[indexNeigh])
-                  {
-                    omp_set_lock(&lock[indexNeigh][iparNeigh % MUTEXES_PER_CELL]);
-                    neigh->density[iparNeigh % PARTICLES_PER_CELL] += tc;
-                    omp_unset_lock(&lock[indexNeigh][iparNeigh % MUTEXES_PER_CELL]);
+                    if (border[index])
+                    {
+                      omp_set_lock(&lock[index][ipar % MUTEXES_PER_CELL]);
+                      cell->density[ipar % PARTICLES_PER_CELL] += tc;
+                      omp_unset_lock(&lock[index][ipar % MUTEXES_PER_CELL]);
+                    }
+                    else
+                      cell->density[ipar % PARTICLES_PER_CELL] += tc;
+
+                    if (border[indexNeigh])
+                    {
+                      omp_set_lock(&lock[indexNeigh][iparNeigh % MUTEXES_PER_CELL]);
+                      neigh->density[iparNeigh % PARTICLES_PER_CELL] += tc;
+                      omp_unset_lock(&lock[indexNeigh][iparNeigh % MUTEXES_PER_CELL]);
+                    }
+                    else
+                      neigh->density[iparNeigh % PARTICLES_PER_CELL] += tc;
                   }
-                  else
-                    neigh->density[iparNeigh % PARTICLES_PER_CELL] += tc;
+                }
+                //move pointer to next cell in list if end of array is reached
+                if (iparNeigh % PARTICLES_PER_CELL == PARTICLES_PER_CELL - 1)
+                {
+                  neigh = neigh->next;
                 }
               }
-              //move pointer to next cell in list if end of array is reached
-              if (iparNeigh % PARTICLES_PER_CELL == PARTICLES_PER_CELL - 1)
-              {
-                neigh = neigh->next;
-              }
+            }
+            //move pointer to next cell in list if end of array is reached
+            if (ipar % PARTICLES_PER_CELL == PARTICLES_PER_CELL - 1)
+            {
+              cell = cell->next;
             }
           }
-          //move pointer to next cell in list if end of array is reached
-          if (ipar % PARTICLES_PER_CELL == PARTICLES_PER_CELL - 1)
-          {
-            cell = cell->next;
-          }
         }
-      }
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
-void ComputeDensities2MT(int tid)
+void ComputeDensities2MT()
 {
   const fptype tc = hSq * hSq * hSq;
-  for (int iz = grids[tid].sz; iz < grids[tid].ez; ++iz)
-    for (int iy = grids[tid].sy; iy < grids[tid].ey; ++iy)
-      for (int ix = grids[tid].sx; ix < grids[tid].ex; ++ix)
+  #pragma omp parallel for num_threads(threadnum)
+  for (int index = 0; index < numCells; ++index)
+  {
+    Cell *cell = &cells[index];
+    int np = cnumPars[index];
+    for (int j = 0; j < np; ++j)
+    {
+      cell->density[j % PARTICLES_PER_CELL] += tc;
+      cell->density[j % PARTICLES_PER_CELL] *= densityCoeff;
+      //move pointer to next cell in list if end of array is reached
+      if (j % PARTICLES_PER_CELL == PARTICLES_PER_CELL - 1)
       {
-        int index = (iz * ny + iy) * nx + ix;
-        Cell *cell = &cells[index];
-        int np = cnumPars[index];
-        for (int j = 0; j < np; ++j)
-        {
-          cell->density[j % PARTICLES_PER_CELL] += tc;
-          cell->density[j % PARTICLES_PER_CELL] *= densityCoeff;
-          //move pointer to next cell in list if end of array is reached
-          if (j % PARTICLES_PER_CELL == PARTICLES_PER_CELL - 1)
-          {
-            cell = cell->next;
-          }
-        }
+        cell = cell->next;
       }
+    }
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
-void ComputeForcesMT(int tid)
+void ComputeForcesMT()
 {
-  int neighCells[3 * 3 * 3];
+  #pragma omp parallel num_threads(threadnum)
+  {
+    int tid = omp_get_thread_num();
+    int neighCells[3 * 3 * 3];
 
-  for (int iz = grids[tid].sz; iz < grids[tid].ez; ++iz)
-    for (int iy = grids[tid].sy; iy < grids[tid].ey; ++iy)
-      for (int ix = grids[tid].sx; ix < grids[tid].ex; ++ix)
-      {
-        int index = (iz * ny + iy) * nx + ix;
-        int np = cnumPars[index];
-        if (np == 0)
-          continue;
-
-        int numNeighCells = InitNeighCellList(ix, iy, iz, neighCells);
-
-        Cell *cell = &cells[index];
-        for (int ipar = 0; ipar < np; ++ipar)
+    for (int iz = grids[tid].sz; iz < grids[tid].ez; ++iz)
+      for (int iy = grids[tid].sy; iy < grids[tid].ey; ++iy)
+        for (int ix = grids[tid].sx; ix < grids[tid].ex; ++ix)
         {
-          for (int inc = 0; inc < numNeighCells; ++inc)
+          int index = (iz * ny + iy) * nx + ix;
+          int np = cnumPars[index];
+          if (np == 0)
+            continue;
+
+          int numNeighCells = InitNeighCellList(ix, iy, iz, neighCells);
+
+          Cell *cell = &cells[index];
+          for (int ipar = 0; ipar < np; ++ipar)
           {
-            int indexNeigh = neighCells[inc];
-            Cell *neigh = &cells[indexNeigh];
-            int numNeighPars = cnumPars[indexNeigh];
-            for (int iparNeigh = 0; iparNeigh < numNeighPars; ++iparNeigh)
+            for (int inc = 0; inc < numNeighCells; ++inc)
             {
-              //Check address to make sure forces are computed only once per pair
-              if (&neigh->p[iparNeigh % PARTICLES_PER_CELL] < &cell->p[ipar % PARTICLES_PER_CELL])
+              int indexNeigh = neighCells[inc];
+              Cell *neigh = &cells[indexNeigh];
+              int numNeighPars = cnumPars[indexNeigh];
+              for (int iparNeigh = 0; iparNeigh < numNeighPars; ++iparNeigh)
               {
-                Vec3 disp = cell->p[ipar % PARTICLES_PER_CELL] - neigh->p[iparNeigh % PARTICLES_PER_CELL];
-                fptype distSq = disp.GetLengthSq();
-                if (distSq < hSq)
+                //Check address to make sure forces are computed only once per pair
+                if (&neigh->p[iparNeigh % PARTICLES_PER_CELL] < &cell->p[ipar % PARTICLES_PER_CELL])
                 {
-#ifndef ENABLE_DOUBLE_PRECISION
-                  fptype dist = sqrtf(std::max(distSq, (fptype)1e-12));
-#else
-                  fptype dist = sqrt(std::max(distSq, 1e-12));
-#endif //ENABLE_DOUBLE_PRECISION
-                  fptype hmr = h - dist;
-
-                  Vec3 acc = disp * pressureCoeff * (hmr * hmr / dist) * (cell->density[ipar % PARTICLES_PER_CELL] + neigh->density[iparNeigh % PARTICLES_PER_CELL] - doubleRestDensity);
-                  acc += (neigh->v[iparNeigh % PARTICLES_PER_CELL] - cell->v[ipar % PARTICLES_PER_CELL]) * viscosityCoeff * hmr;
-                  acc /= cell->density[ipar % PARTICLES_PER_CELL] * neigh->density[iparNeigh % PARTICLES_PER_CELL];
-
-                  if (border[index])
+                  Vec3 disp = cell->p[ipar % PARTICLES_PER_CELL] - neigh->p[iparNeigh % PARTICLES_PER_CELL];
+                  fptype distSq = disp.GetLengthSq();
+                  if (distSq < hSq)
                   {
-                    omp_set_lock(&lock[index][ipar % MUTEXES_PER_CELL]);
-                    cell->a[ipar % PARTICLES_PER_CELL] += acc;
-                    omp_unset_lock(&lock[index][ipar % MUTEXES_PER_CELL]);
-                  }
-                  else
-                    cell->a[ipar % PARTICLES_PER_CELL] += acc;
+  #ifndef ENABLE_DOUBLE_PRECISION
+                    fptype dist = sqrtf(std::max(distSq, (fptype)1e-12));
+  #else
+                    fptype dist = sqrt(std::max(distSq, 1e-12));
+  #endif //ENABLE_DOUBLE_PRECISION
+                    fptype hmr = h - dist;
 
-                  if (border[indexNeigh])
-                  {
-                    omp_set_lock(&lock[indexNeigh][iparNeigh % MUTEXES_PER_CELL]);
-                    neigh->a[iparNeigh % PARTICLES_PER_CELL] -= acc;
-                    omp_unset_lock(&lock[indexNeigh][iparNeigh % MUTEXES_PER_CELL]);
+                    Vec3 acc = disp * pressureCoeff * (hmr * hmr / dist) * (cell->density[ipar % PARTICLES_PER_CELL] + neigh->density[iparNeigh % PARTICLES_PER_CELL] - doubleRestDensity);
+                    acc += (neigh->v[iparNeigh % PARTICLES_PER_CELL] - cell->v[ipar % PARTICLES_PER_CELL]) * viscosityCoeff * hmr;
+                    acc /= cell->density[ipar % PARTICLES_PER_CELL] * neigh->density[iparNeigh % PARTICLES_PER_CELL];
+
+                    if (border[index])
+                    {
+                      omp_set_lock(&lock[index][ipar % MUTEXES_PER_CELL]);
+                      cell->a[ipar % PARTICLES_PER_CELL] += acc;
+                      omp_unset_lock(&lock[index][ipar % MUTEXES_PER_CELL]);
+                    }
+                    else
+                      cell->a[ipar % PARTICLES_PER_CELL] += acc;
+
+                    if (border[indexNeigh])
+                    {
+                      omp_set_lock(&lock[indexNeigh][iparNeigh % MUTEXES_PER_CELL]);
+                      neigh->a[iparNeigh % PARTICLES_PER_CELL] -= acc;
+                      omp_unset_lock(&lock[indexNeigh][iparNeigh % MUTEXES_PER_CELL]);
+                    }
+                    else
+                      neigh->a[iparNeigh % PARTICLES_PER_CELL] -= acc;
                   }
-                  else
-                    neigh->a[iparNeigh % PARTICLES_PER_CELL] -= acc;
+                }
+                //move pointer to next cell in list if end of array is reached
+                if (iparNeigh % PARTICLES_PER_CELL == PARTICLES_PER_CELL - 1)
+                {
+                  neigh = neigh->next;
                 }
               }
-              //move pointer to next cell in list if end of array is reached
-              if (iparNeigh % PARTICLES_PER_CELL == PARTICLES_PER_CELL - 1)
+            }
+            //move pointer to next cell in list if end of array is reached
+            if (ipar % PARTICLES_PER_CELL == PARTICLES_PER_CELL - 1)
+            {
+              cell = cell->next;
+            }
+          }
+        }
+  }
+}
+
+void ProcessCollisionsMT()
+{
+  #pragma omp parallel num_threads(threadnum)
+  {
+    int tid = omp_get_thread_num();
+    for (int iz = grids[tid].sz; iz < grids[tid].ez; ++iz)
+    {
+      for (int iy = grids[tid].sy; iy < grids[tid].ey; ++iy)
+      {
+        for (int ix = grids[tid].sx; ix < grids[tid].ex; ++ix)
+        {
+          if (!((ix == 0) || (iy == 0) || (iz == 0) || (ix == (nx - 1)) || (iy == (ny - 1)) == (iz == (nz - 1))))
+            continue; // not on domain wall
+          int index = (iz * ny + iy) * nx + ix;
+          Cell *cell = &cells[index];
+          int np = cnumPars[index];
+          for (int j = 0; j < np; ++j)
+          {
+            int ji = j % PARTICLES_PER_CELL;
+            Vec3 pos = cell->p[ji] + cell->hv[ji] * timeStep;
+
+            if (ix == 0)
+            {
+              fptype diff = parSize - (pos.x - domainMin.x);
+              if (diff > epsilon)
+                cell->a[ji].x += stiffnessCollisions * diff - damping * cell->v[ji].x;
+            }
+            if (ix == (nx - 1))
+            {
+              fptype diff = parSize - (domainMax.x - pos.x);
+              if (diff > epsilon)
+                cell->a[ji].x -= stiffnessCollisions * diff + damping * cell->v[ji].x;
+            }
+            if (iy == 0)
+            {
+              fptype diff = parSize - (pos.y - domainMin.y);
+              if (diff > epsilon)
+                cell->a[ji].y += stiffnessCollisions * diff - damping * cell->v[ji].y;
+            }
+            if (iy == (ny - 1))
+            {
+              fptype diff = parSize - (domainMax.y - pos.y);
+              if (diff > epsilon)
+                cell->a[ji].y -= stiffnessCollisions * diff + damping * cell->v[ji].y;
+            }
+            if (iz == 0)
+            {
+              fptype diff = parSize - (pos.z - domainMin.z);
+              if (diff > epsilon)
+                cell->a[ji].z += stiffnessCollisions * diff - damping * cell->v[ji].z;
+            }
+            if (iz == (nz - 1))
+            {
+              fptype diff = parSize - (domainMax.z - pos.z);
+              if (diff > epsilon)
+                cell->a[ji].z -= stiffnessCollisions * diff + damping * cell->v[ji].z;
+            }
+            //move pointer to next cell in list if end of array is reached
+            if (ji == PARTICLES_PER_CELL - 1)
+            {
+              cell = cell->next;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+void ProcessCollisions2MT()
+{
+  #pragma omp parallel num_threads(threadnum)
+  {
+    int tid = omp_get_thread_num();
+    for (int iz = grids[tid].sz; iz < grids[tid].ez; ++iz)
+    {
+      for (int iy = grids[tid].sy; iy < grids[tid].ey; ++iy)
+      {
+        for (int ix = grids[tid].sx; ix < grids[tid].ex; ++ix)
+        {
+          int index = (iz * ny + iy) * nx + ix;
+          Cell *cell = &cells[index];
+          int np = cnumPars[index];
+          for (int j = 0; j < np; ++j)
+          {
+            int ji = j % PARTICLES_PER_CELL;
+            Vec3 pos = cell->p[ji];
+
+            if (ix == 0)
+            {
+              fptype diff = pos.x - domainMin.x;
+              if (diff < Zero)
               {
-                neigh = neigh->next;
+                cell->p[ji].x = domainMin.x - diff;
+                cell->v[ji].x = -cell->v[ji].x;
+                cell->hv[ji].x = -cell->hv[ji].x;
               }
             }
-          }
-          //move pointer to next cell in list if end of array is reached
-          if (ipar % PARTICLES_PER_CELL == PARTICLES_PER_CELL - 1)
-          {
-            cell = cell->next;
-          }
-        }
-      }
-}
-
-void ProcessCollisionsMT(int tid)
-{
-  for (int iz = grids[tid].sz; iz < grids[tid].ez; ++iz)
-  {
-    for (int iy = grids[tid].sy; iy < grids[tid].ey; ++iy)
-    {
-      for (int ix = grids[tid].sx; ix < grids[tid].ex; ++ix)
-      {
-        if (!((ix == 0) || (iy == 0) || (iz == 0) || (ix == (nx - 1)) || (iy == (ny - 1)) == (iz == (nz - 1))))
-          continue; // not on domain wall
-        int index = (iz * ny + iy) * nx + ix;
-        Cell *cell = &cells[index];
-        int np = cnumPars[index];
-        for (int j = 0; j < np; ++j)
-        {
-          int ji = j % PARTICLES_PER_CELL;
-          Vec3 pos = cell->p[ji] + cell->hv[ji] * timeStep;
-
-          if (ix == 0)
-          {
-            fptype diff = parSize - (pos.x - domainMin.x);
-            if (diff > epsilon)
-              cell->a[ji].x += stiffnessCollisions * diff - damping * cell->v[ji].x;
-          }
-          if (ix == (nx - 1))
-          {
-            fptype diff = parSize - (domainMax.x - pos.x);
-            if (diff > epsilon)
-              cell->a[ji].x -= stiffnessCollisions * diff + damping * cell->v[ji].x;
-          }
-          if (iy == 0)
-          {
-            fptype diff = parSize - (pos.y - domainMin.y);
-            if (diff > epsilon)
-              cell->a[ji].y += stiffnessCollisions * diff - damping * cell->v[ji].y;
-          }
-          if (iy == (ny - 1))
-          {
-            fptype diff = parSize - (domainMax.y - pos.y);
-            if (diff > epsilon)
-              cell->a[ji].y -= stiffnessCollisions * diff + damping * cell->v[ji].y;
-          }
-          if (iz == 0)
-          {
-            fptype diff = parSize - (pos.z - domainMin.z);
-            if (diff > epsilon)
-              cell->a[ji].z += stiffnessCollisions * diff - damping * cell->v[ji].z;
-          }
-          if (iz == (nz - 1))
-          {
-            fptype diff = parSize - (domainMax.z - pos.z);
-            if (diff > epsilon)
-              cell->a[ji].z -= stiffnessCollisions * diff + damping * cell->v[ji].z;
-          }
-          //move pointer to next cell in list if end of array is reached
-          if (ji == PARTICLES_PER_CELL - 1)
-          {
-            cell = cell->next;
-          }
-        }
-      }
-    }
-  }
-}
-
-void ProcessCollisions2MT(int tid)
-{
-  for (int iz = grids[tid].sz; iz < grids[tid].ez; ++iz)
-  {
-    for (int iy = grids[tid].sy; iy < grids[tid].ey; ++iy)
-    {
-      for (int ix = grids[tid].sx; ix < grids[tid].ex; ++ix)
-      {
-        int index = (iz * ny + iy) * nx + ix;
-        Cell *cell = &cells[index];
-        int np = cnumPars[index];
-        for (int j = 0; j < np; ++j)
-        {
-          int ji = j % PARTICLES_PER_CELL;
-          Vec3 pos = cell->p[ji];
-
-          if (ix == 0)
-          {
-            fptype diff = pos.x - domainMin.x;
-            if (diff < Zero)
+            if (ix == (nx - 1))
             {
-              cell->p[ji].x = domainMin.x - diff;
-              cell->v[ji].x = -cell->v[ji].x;
-              cell->hv[ji].x = -cell->hv[ji].x;
+              fptype diff = domainMax.x - pos.x;
+              if (diff < Zero)
+              {
+                cell->p[ji].x = domainMax.x + diff;
+                cell->v[ji].x = -cell->v[ji].x;
+                cell->hv[ji].x = -cell->hv[ji].x;
+              }
             }
-          }
-          if (ix == (nx - 1))
-          {
-            fptype diff = domainMax.x - pos.x;
-            if (diff < Zero)
+            if (iy == 0)
             {
-              cell->p[ji].x = domainMax.x + diff;
-              cell->v[ji].x = -cell->v[ji].x;
-              cell->hv[ji].x = -cell->hv[ji].x;
+              fptype diff = pos.y - domainMin.y;
+              if (diff < Zero)
+              {
+                cell->p[ji].y = domainMin.y - diff;
+                cell->v[ji].y = -cell->v[ji].y;
+                cell->hv[ji].y = -cell->hv[ji].y;
+              }
             }
-          }
-          if (iy == 0)
-          {
-            fptype diff = pos.y - domainMin.y;
-            if (diff < Zero)
+            if (iy == (ny - 1))
             {
-              cell->p[ji].y = domainMin.y - diff;
-              cell->v[ji].y = -cell->v[ji].y;
-              cell->hv[ji].y = -cell->hv[ji].y;
+              fptype diff = domainMax.y - pos.y;
+              if (diff < Zero)
+              {
+                cell->p[ji].y = domainMax.y + diff;
+                cell->v[ji].y = -cell->v[ji].y;
+                cell->hv[ji].y = -cell->hv[ji].y;
+              }
             }
-          }
-          if (iy == (ny - 1))
-          {
-            fptype diff = domainMax.y - pos.y;
-            if (diff < Zero)
+            if (iz == 0)
             {
-              cell->p[ji].y = domainMax.y + diff;
-              cell->v[ji].y = -cell->v[ji].y;
-              cell->hv[ji].y = -cell->hv[ji].y;
+              fptype diff = pos.z - domainMin.z;
+              if (diff < Zero)
+              {
+                cell->p[ji].z = domainMin.z - diff;
+                cell->v[ji].z = -cell->v[ji].z;
+                cell->hv[ji].z = -cell->hv[ji].z;
+              }
             }
-          }
-          if (iz == 0)
-          {
-            fptype diff = pos.z - domainMin.z;
-            if (diff < Zero)
+            if (iz == (nz - 1))
             {
-              cell->p[ji].z = domainMin.z - diff;
-              cell->v[ji].z = -cell->v[ji].z;
-              cell->hv[ji].z = -cell->hv[ji].z;
+              fptype diff = domainMax.z - pos.z;
+              if (diff < Zero)
+              {
+                cell->p[ji].z = domainMax.z + diff;
+                cell->v[ji].z = -cell->v[ji].z;
+                cell->hv[ji].z = -cell->hv[ji].z;
+              }
             }
-          }
-          if (iz == (nz - 1))
-          {
-            fptype diff = domainMax.z - pos.z;
-            if (diff < Zero)
+            //move pointer to next cell in list if end of array is reached
+            if (ji == PARTICLES_PER_CELL - 1)
             {
-              cell->p[ji].z = domainMax.z + diff;
-              cell->v[ji].z = -cell->v[ji].z;
-              cell->hv[ji].z = -cell->hv[ji].z;
+              cell = cell->next;
             }
-          }
-          //move pointer to next cell in list if end of array is reached
-          if (ji == PARTICLES_PER_CELL - 1)
-          {
-            cell = cell->next;
           }
         }
       }
@@ -1008,81 +1020,62 @@ void ProcessCollisions2MT(int tid)
 
 ////////////////////////////////////////////////////////////////////////////////
 
-void AdvanceParticlesMT(int tid)
+void AdvanceParticlesMT()
 {
-  for (int iz = grids[tid].sz; iz < grids[tid].ez; ++iz)
-    for (int iy = grids[tid].sy; iy < grids[tid].ey; ++iy)
-      for (int ix = grids[tid].sx; ix < grids[tid].ex; ++ix)
-      {
-        int index = (iz * ny + iy) * nx + ix;
-        Cell *cell = &cells[index];
-        int np = cnumPars[index];
-        for (int j = 0; j < np; ++j)
-        {
-          Vec3 v_half = cell->hv[j % PARTICLES_PER_CELL] + cell->a[j % PARTICLES_PER_CELL] * timeStep;
-          // N.B. The integration of the position can place the particle
-          // outside the domain. Although we could place a test in this loop
-          // we would be unnecessarily testing particles on interior cells.
-          // Therefore, to reduce the amount of computations we make a later
-          // pass on the perimiter cells to account for particle migration
-          // beyond domain
-          cell->p[j % PARTICLES_PER_CELL] += v_half * timeStep;
-          cell->v[j % PARTICLES_PER_CELL] = cell->hv[j % PARTICLES_PER_CELL] + v_half;
-          cell->v[j % PARTICLES_PER_CELL] *= 0.5;
-          cell->hv[j % PARTICLES_PER_CELL] = v_half;
+  #pragma omp parallel for num_threads(threadnum)
+  for (int index = 0; index < numCells; ++index)
+  {
+    Cell *cell = &cells[index];
+    int np = cnumPars[index];
+    for (int j = 0; j < np; ++j)
+    {
+      Vec3 v_half = cell->hv[j % PARTICLES_PER_CELL] + cell->a[j % PARTICLES_PER_CELL] * timeStep;
+      // N.B. The integration of the position can place the particle
+      // outside the domain. Although we could place a test in this loop
+      // we would be unnecessarily testing particles on interior cells.
+      // Therefore, to reduce the amount of computations we make a later
+      // pass on the perimiter cells to account for particle migration
+      // beyond domain
+      cell->p[j % PARTICLES_PER_CELL] += v_half * timeStep;
+      cell->v[j % PARTICLES_PER_CELL] = cell->hv[j % PARTICLES_PER_CELL] + v_half;
+      cell->v[j % PARTICLES_PER_CELL] *= 0.5;
+      cell->hv[j % PARTICLES_PER_CELL] = v_half;
 
-          //move pointer to next cell in list if end of array is reached
-          if (j % PARTICLES_PER_CELL == PARTICLES_PER_CELL - 1)
-          {
-            cell = cell->next;
-          }
-        }
+      //move pointer to next cell in list if end of array is reached
+      if (j % PARTICLES_PER_CELL == PARTICLES_PER_CELL - 1)
+      {
+        cell = cell->next;
       }
+    }
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
-void AdvanceFrameMT(int tid)
+void AdvanceFrameMT()
 {
-//swap src and dest arrays with particles
-#pragma omp master
-  {
-    std::swap(cells, cells2);
-    std::swap(cnumPars, cnumPars2);
-  }
-#pragma omp barrier
+  // swap src and dest arrays with particles
+  std::swap(cells, cells2);
+  std::swap(cnumPars, cnumPars2);
 
-  ClearParticlesMT(tid);
-#pragma omp barrier
-  RebuildGridMT(tid);
-#pragma omp barrier
-  InitDensitiesAndForcesMT(tid);
-#pragma omp barrier
-  ComputeDensitiesMT(tid);
-#pragma omp barrier
-  ComputeDensities2MT(tid);
-#pragma omp barrier
-  ComputeForcesMT(tid);
-#pragma omp barrier
-  ProcessCollisionsMT(tid);
-#pragma omp barrier
-  AdvanceParticlesMT(tid);
-#pragma omp barrier
+  ClearParticlesMT();
+  RebuildGridMT();
+  InitDensitiesAndForcesMT();
+  ComputeDensitiesMT();
+  ComputeDensities2MT();
+  ComputeForcesMT();
+  ProcessCollisionsMT();
+  AdvanceParticlesMT();
   // N.B. The integration of the position can place the particle
   // outside the domain. We now make a pass on the perimiter cells
   // to account for particle migration beyond domain.
-  ProcessCollisions2MT(tid);
-#pragma omp barrier
+  ProcessCollisions2MT();
 }
 
-void AdvanceFramesMT(int threadnum, int framenum)
+void AdvanceFramesMT(int framenum)
 {
-#pragma omp parallel num_threads(threadnum)
   for (int i = 0; i < framenum; ++i)
-  {
-    int tid = omp_get_thread_num();
-    AdvanceFrameMT(tid);
-  }
+    AdvanceFrameMT();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1108,8 +1101,8 @@ int main(int argc, char *argv[])
     return -1;
   }
 
-  int threadnum = atoi(argv[1]);
-  int framenum = atoi(argv[2]);
+  threadnum = atoi(argv[1]);
+  framenum = atoi(argv[2]);
 
   //Check arguments
   if (threadnum < 1)
@@ -1133,7 +1126,7 @@ int main(int argc, char *argv[])
   __parsec_roi_begin();
 #endif
 
-  AdvanceFramesMT(threadnum, framenum);
+  AdvanceFramesMT(framenum);
 
 #ifdef ENABLE_PARSEC_HOOKS
   __parsec_roi_end();
